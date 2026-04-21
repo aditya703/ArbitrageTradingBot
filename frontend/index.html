@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Arbitrage Engine</title>
+    <link rel="stylesheet" href="style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- Navigation Sidebar -->
+    <nav class="sidebar">
+        <div class="sidebar-trigger"></div>
+        <div class="sidebar-content">
+            <div class="sidebar-logo">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" class="pulse-icon">
+                    <path d="M12 2L2 22h20L12 2zm0 6l5 10H7l5-10z" fill="currentColor"/>
+                </svg>
+                <h2>Menu</h2>
+            </div>
+            <ul class="nav-links">
+                <li class="nav-item active" data-target="trading-view">
+                    <span>Trading Engine</span>
+                </li>
+                <li class="nav-item" data-target="investments-view">
+                    <span>My Investments</span>
+                </li>
+                <li class="nav-item" data-target="pnl-view">
+                    <span>Intraday PnL</span>
+                </li>
+                <li class="nav-item" data-target="orders-view">
+                    <span>Order Book</span>
+                </li>
+            </ul>
+        </div>
+    </nav>
+
+    <div class="app-container">
+        <!-- Header Section -->
+        <header class="header">
+            <div class="logo">
+                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" class="pulse-icon">
+                    <path d="M12 2L2 22h20L12 2zm0 6l5 10H7l5-10z" fill="currentColor"/>
+                </svg>
+                <h1>Arbitrage Engine</h1>
+            </div>
+            <div class="status-indicator">
+                <div id="connection-dot" class="dot disconnected"></div>
+                <span id="connection-text">
+                    Kite Disconnected
+                    <a id="login-link" href="#" style="color: var(--accent-primary); margin-left:8px; text-decoration:none;">Login -></a>
+                </span>
+            </div>
+        </header>
+
+        <!-- View: Trading Engine -->
+        <div id="trading-view" class="view-section">
+            <main class="dashboard">
+                <!-- Market Overview Card -->
+                <section class="card market-card">
+                    <div class="market-header" style="justify-content: space-between;">
+                        <div style="display: flex; align-items: center; gap: 1rem;">
+                            <h2>Watchlist</h2>
+                            <div class="add-symbol-widget" style="display: flex; gap: 0.5rem;">
+                                <input type="text" id="new-symbol-input" placeholder="INFY" style="background: rgba(0,0,0,0.3); border: 1px solid var(--border-color); color: white; padding: 0.25rem 0.5rem; border-radius: 4px; width: 100px; text-transform: uppercase;">
+                                <button id="add-symbol-btn" class="btn" style="background: var(--accent-primary); color: white; padding: 0.25rem 0.75rem; border-radius: 4px; font-size: 1.2rem;">+</button>
+                            </div>
+                        </div>
+                        <div style="display: flex; gap: 1rem; align-items: center;">
+                            <div class="threshold-control" style="display: flex; flex-direction: column; align-items: flex-end;">
+                                <label for="buffer-slider" style="font-size: 0.8rem; color: var(--text-secondary);">Execution Buffer: <span id="buffer-val" style="color: var(--accent-primary); font-weight: bold;">0.25x</span></label>
+                                <input type="range" id="buffer-slider" min="0.00" max="1.0" step="0.05" value="0.25" style="width: 100px;">
+                            </div>
+                            <div class="threshold-control" style="display: flex; flex-direction: column; align-items: flex-end;">
+                                <label for="threshold-slider" style="font-size: 0.8rem; color: var(--text-secondary);">Arbitrage Threshold: <span id="threshold-val" style="color: var(--accent-primary); font-weight: bold;">0.10%</span></label>
+                                <input type="range" id="threshold-slider" min="0.01" max="0.30" step="0.01" value="0.10" style="width: 120px;">
+                            </div>
+                        </div>
+                    </div>
+                    
+                    <!-- Tracked Symbols Container -->
+                    <div id="tracked-symbols-container" class="tracked-symbols-list">
+                        <!-- Rows will be dynamically injected here via JS -->
+                    </div>
+                    
+                    <div id="arbitrage-flag" style="display: none; background: rgba(46, 204, 113, 0.2); border: 1px solid var(--success); color: var(--success); padding: 0.5rem 1rem; border-radius: 8px; margin-top: 1rem; text-align: center; font-weight: 600; text-shadow: 0 0 10px rgba(46,204,113,0.3);">
+                        Arbitrage Opportunity Detected! Autofilled optimum execution legs.
+                    </div>
+                    
+                    <!-- Targeted Execution Trade Block -->
+                    <div class="execution-config" style="display: flex; gap: 1rem; margin-top: 1rem; flex-wrap: wrap;">
+                        <div style="width: 100%; border-bottom: 1px solid var(--border-color); padding-bottom: 0.5rem; margin-bottom: 0.5rem; color: var(--text-secondary); font-weight: 600;">
+                            Executing For: <span id="execution-target-symbol" style="color: var(--accent-primary); font-family: var(--font-heading); margin-left: 0.5rem;">NONE</span>
+                            <input type="hidden" id="symbol" value="">
+                        </div>
+                        <!-- Leg 1: BUY -->
+                        <div class="leg-group" style="flex: 1; background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
+                            <h4 style="color: var(--success); margin-bottom: 0.5rem;">Buy Leg</h4>
+                            <div class="input-group" style="margin-bottom: 0.5rem;">
+                                <label>Exchange</label>
+                                <select id="buy-exchange" class="form-select" style="background: rgba(0,0,0,0.3); color: white; border: 1px solid var(--border-color); padding: 0.5rem; border-radius: 4px;">
+                                    <option value="NSE">NSE</option>
+                                    <option value="BSE">BSE</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
+                                <label for="buy-price">Limit Buy Price</label>
+                                <input type="number" id="buy-price" placeholder="0.00" step="0.05" min="0">
+                            </div>
+                        </div>
+
+                        <!-- Leg 2: SELL -->
+                        <div class="leg-group" style="flex: 1; background: rgba(0,0,0,0.2); padding: 1rem; border-radius: 8px; border: 1px solid rgba(255,255,255,0.05);">
+                            <h4 style="color: var(--danger); margin-bottom: 0.5rem;">Sell Leg</h4>
+                            <div class="input-group" style="margin-bottom: 0.5rem;">
+                                <label>Exchange</label>
+                                <select id="sell-exchange" class="form-select" style="background: rgba(0,0,0,0.3); color: white; border: 1px solid var(--border-color); padding: 0.5rem; border-radius: 4px;">
+                                    <option value="BSE">BSE</option>
+                                    <option value="NSE">NSE</option>
+                                </select>
+                            </div>
+                            <div class="input-group">
+                                <label for="sell-price">Limit Sell Price</label>
+                                <input type="number" id="sell-price" placeholder="0.00" step="0.05" min="0">
+                            </div>
+                        </div>
+                    </div>
+                </section>
+
+                <!-- Execution Controls -->
+                <section class="controls">
+                    <div style="display: flex; gap: 1rem; width: 100%;">
+                        <button id="trade-btn" class="btn primary-btn pulse-glow" style="flex: 2;">
+                            <span>Execute Single Trade</span>
+                            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <path d="M5 12h14M12 5l7 7-7 7"/>
+                            </svg>
+                        </button>
+                        <button id="auto-trade-btn" class="btn outline-btn" style="flex: 1; transition: all 0.3s; font-size: 0.9rem;">
+                            <span>Auto-Trade: OFF</span>
+                        </button>
+                    </div>
+                </section>
+
+                <!-- Emergency Kill Switch -->
+                <section class="emergency-controls" style="display: flex; gap: 1rem; align-items: center; justify-content: center; flex-wrap: wrap;">
+                    <button id="stop-btn" class="btn kill-btn">
+                        EMERGENCY STOP
+                    </button>
+                    <div id="algo-status" class="algo-status">Algo Ready</div>
+                    <div id="latency-display" style="background: rgba(0,0,0,0.5); border: 1px solid rgba(255,255,255,0.1); padding: 0.75rem 1.5rem; border-radius: 8px; font-weight: 600; font-family: 'Space Grotesk', monospace; color: var(--text-secondary); display: flex; align-items: center; gap: 0.5rem;">
+                        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
+                        <span id="latency-val">Latency: -- ms</span>
+                    </div>
+                    <button id="reset-btn" class="btn outline-btn hidden">Reset System</button>
+                </section>
+
+                <!-- Trade Log -->
+                <section class="card log-card">
+                    <h2>Execution Log</h2>
+                    <div class="log-terminal" id="log-container">
+                        <!-- Logs will appear here -->
+                        <div class="log-entry system">System initialized. Awaiting commands...</div>
+                    </div>
+                </section>
+            </main>
+        </div>
+
+        <!-- View: My Investments -->
+        <div id="investments-view" class="view-section hidden">
+            <main class="dashboard">
+                <section class="card">
+                    <h2>Live Portfolio</h2>
+                    <div class="table-container">
+                        <table class="investments-table">
+                            <thead>
+                                <tr>
+                                    <th>Symbol</th>
+                                    <th>Quantity</th>
+                                    <th>Avg Price</th>
+                                    <th>Last Price</th>
+                                    <th>PnL</th>
+                                </tr>
+                            </thead>
+                            <tbody id="holdings-body">
+                                <tr>
+                                    <td colspan="5" style="text-align: center; padding: 2rem;">Loading holdings...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </main>
+        </div>
+
+        <!-- View: Intraday PnL -->
+        <div id="pnl-view" class="view-section hidden">
+            <main class="dashboard">
+                <section class="card">
+                    <h2>Intraday Performance</h2>
+                    <div style="padding: 1.5rem; text-align: center; border-bottom: 1px solid var(--border);">
+                        <p style="color: var(--text-secondary); margin-bottom: 0.5rem; font-size: 0.9rem;">Total Intraday M2M</p>
+                        <h1 id="total-pnl-header" style="font-size: 2.5rem; font-family: 'Space Grotesk', sans-serif;">₹ 0.00</h1>
+                    </div>
+                    <div class="table-container">
+                        <table class="investments-table">
+                            <thead>
+                                <tr>
+                                    <th>Symbol</th>
+                                    <th>Qty</th>
+                                    <th>Avg Buy</th>
+                                    <th>Avg Sell</th>
+                                    <th>LTP</th>
+                                    <th>PnL</th>
+                                </tr>
+                            </thead>
+                            <tbody id="pnl-body">
+                                <tr>
+                                    <td colspan="6" style="text-align: center; padding: 2rem;">Loading PnL...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </main>
+        </div>
+
+        <!-- View: Order Book -->
+        <div id="orders-view" class="view-section hidden">
+            <main class="dashboard">
+                <section class="card">
+                    <h2>Order Book</h2>
+                    <div class="table-container">
+                        <table class="investments-table">
+                            <thead>
+                                <tr>
+                                    <th>Time</th>
+                                    <th>Symbol</th>
+                                    <th>Type</th>
+                                    <th>Qty</th>
+                                    <th>Price</th>
+                                    <th>Status</th>
+                                </tr>
+                            </thead>
+                            <tbody id="orders-body">
+                                <tr>
+                                    <td colspan="6" style="text-align: center; padding: 2rem;">Loading orders...</td>
+                                </tr>
+                            </tbody>
+                        </table>
+                    </div>
+                </section>
+            </main>
+        </div>
+    </div>
+    
+    <script src="app.js"></script>
+</body>
+</html>
