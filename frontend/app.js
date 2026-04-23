@@ -18,6 +18,8 @@ document.addEventListener("DOMContentLoaded", () => {
     const thresholdVal = document.getElementById("threshold-val");
     const bufferSlider = document.getElementById("buffer-slider");
     const bufferVal = document.getElementById("buffer-val");
+    const allocatedFundsInput = document.getElementById("allocated-funds");
+    const liveMarginVal = document.getElementById("live-margin-val");
 
     // Pre-cache execution config elements
     const buyExchangeSelect = document.getElementById("buy-exchange");
@@ -59,28 +61,53 @@ document.addEventListener("DOMContentLoaded", () => {
             const res = await fetch(`${BASE_URL}/status`);
             const data = await res.json();
             
-            if (data.connected) {
-                connectionDot.className = "dot connected";
-                connectionText.innerHTML = "Kite Connected";
-            } else {
-                connectionDot.className = "dot disconnected";
-                connectionText.innerHTML = `Kite Disconnected <a id="login-link" href="${BASE_URL}/login" target="_blank" style="color: var(--accent-primary); margin-left:8px; text-decoration:none;">Login -></a>`;
-            }
+            if (data.connected !== undefined) {
+                if (data.connected) {
+                    connectionDot.className = "dot connected";
+                    connectionText.textContent = "Backend Connected";
+                } else {
+                    connectionDot.className = "dot disconnected";
+                    connectionText.innerHTML = `Kite Disconnected <a id="login-link" href="${BASE_URL}/login" target="_blank" style="color: var(--accent-primary); margin-left:8px; text-decoration:none;">Login -></a>`;
+                }
 
-            if (data.stop_requested) {
-                algoStatus.textContent = "SYSTEM HALTED";
-                algoStatus.className = "algo-status stopped";
-                if (tradeBtn) tradeBtn.disabled = true;
-                if (resetBtn) resetBtn.classList.remove("hidden");
-            } else {
-                algoStatus.textContent = data.algo_running ? "Algo Running..." : "Algo Ready";
-                algoStatus.className = "algo-status";
-                if (tradeBtn) tradeBtn.disabled = false;
-                if (resetBtn) resetBtn.classList.add("hidden");
+                algoStatus.textContent = data.algo_running ? "EXECUTING" : (data.stop_requested ? "SYSTEM HALTED" : "STANDBY");
+                algoStatus.className = "algo-status " + (data.algo_running ? "running" : (data.stop_requested ? "stopped" : "standby"));
+                
+                if (data.stop_requested) {
+                    if (tradeBtn) tradeBtn.disabled = true;
+                    if (resetBtn) resetBtn.classList.remove("hidden");
+                    if (isAutoTradeArmed) {
+                        isAutoTradeArmed = false;
+                        if(autoTradeBtn) {
+                            autoTradeBtn.innerHTML = `<span>Auto-Trade: OFF (HALTED)</span>`;
+                            autoTradeBtn.classList.remove("auto-trade-active");
+                        }
+                    }
+                } else {
+                    if (tradeBtn) tradeBtn.disabled = false;
+                    if (resetBtn) resetBtn.classList.add("hidden");
+                }
             }
         } catch (error) {
             connectionDot.className = "dot disconnected";
             connectionText.textContent = "Backend Offline";
+        }
+        
+        loadMargins();
+    };
+
+    const loadMargins = async () => {
+        if (!liveMarginVal) return;
+        try {
+            const res = await fetch(`${BASE_URL}/margins`);
+            const data = await res.json();
+            if (data.status === "success") {
+                liveMarginVal.textContent = `₹ ${parseFloat(data.data).toFixed(2)}`;
+            } else {
+                liveMarginVal.textContent = "₹ --";
+            }
+        } catch (e) {
+            liveMarginVal.textContent = "₹ --";
         }
     };
 
@@ -89,6 +116,19 @@ document.addEventListener("DOMContentLoaded", () => {
     let trackedSymbols = JSON.parse(localStorage.getItem("watchlist_memory")) || defaultSymbols;
     let trackedQuantities = JSON.parse(localStorage.getItem("quantity_memory")) || {};
     let isAutoTradeArmed = false;
+
+    // Load saved fund allocation
+    const savedFunds = localStorage.getItem("allocated_funds_memory");
+    if (savedFunds && allocatedFundsInput) {
+        allocatedFundsInput.value = savedFunds;
+    }
+
+    if (allocatedFundsInput) {
+        allocatedFundsInput.addEventListener("change", (e) => {
+            const val = parseFloat(e.target.value) || 0;
+            localStorage.setItem("allocated_funds_memory", val.toString());
+        });
+    }
 
     const saveWatchlist = () => {
         localStorage.setItem("watchlist_memory", JSON.stringify(trackedSymbols));
@@ -181,13 +221,14 @@ document.addEventListener("DOMContentLoaded", () => {
     // ---------- Core: Arbitrage Detection Logic ----------
     // In-memory price cache updated by WebSocket or REST
     const priceCache = {};  // { "INFY": { nse: 1842.5, bse: 1843.0 }, ... }
+    const depthCache = {};  // { "INFY": { nse_bid: 1842, nse_ask: 1843, bse_bid: 1843, bse_ask: 1844, ... }, ... }
+    const activeExecutions = {}; // { "INFY": { startTime: ..., unlocking: false }, ... }
 
     const processArbitrageDetection = () => {
         const thresholdPerc = parseFloat(thresholdSlider.value) || 0.10;
         const bufferFraction = parseFloat(bufferSlider ? bufferSlider.value : 0.25);
 
-        let bestOpportunity = null;
-        let maxSpread = 0;
+        let opportunities = [];
 
         for (const sym of trackedSymbols) {
             const data = priceCache[sym];
@@ -202,20 +243,33 @@ document.addEventListener("DOMContentLoaded", () => {
             if (nseEl) nseEl.textContent = data.nse > 0 ? `₹ ${data.nse.toFixed(3)}` : "₹ --";
             if (bseEl) bseEl.textContent = data.bse > 0 ? `₹ ${data.bse.toFixed(3)}` : "₹ --";
 
-            // Arbitrage detection
+            // Arbitrage detection — use depth data if available for true actionable spread
             if (data.nse > 0 && data.bse > 0) {
-                const priceDiff = Math.abs(data.nse - data.bse);
+                const depth = depthCache[sym];
+                let actionableSpread;
+                let buyFromNse;
+
+                if (depth && depth.nse_ask > 0 && depth.bse_bid > 0 && depth.bse_ask > 0 && depth.nse_bid > 0) {
+                    // True actionable spread: compare best_ask on cheap exchange vs best_bid on expensive exchange
+                    const nse_buy_bse_sell = depth.bse_bid - depth.nse_ask; // profit if buy NSE, sell BSE
+                    const bse_buy_nse_sell = depth.nse_bid - depth.bse_ask; // profit if buy BSE, sell NSE
+                    actionableSpread = Math.max(nse_buy_bse_sell, bse_buy_nse_sell);
+                    buyFromNse = nse_buy_bse_sell >= bse_buy_nse_sell;
+                } else {
+                    // Fallback to LTP-based spread
+                    actionableSpread = Math.abs(data.nse - data.bse);
+                    buyFromNse = data.nse < data.bse;
+                }
+
                 const avgPrice = (data.nse + data.bse) / 2;
+                const priceDiff = Math.abs(actionableSpread);
                 const threshold = (thresholdPerc / 100) * avgPrice;
 
-                if (priceDiff > threshold) {
+                if (actionableSpread > threshold) {
                     if (tickEl) tickEl.classList.add("active");
                     if (checkIcon) checkIcon.style.display = "block";
-
-                    if (priceDiff > maxSpread) {
-                        maxSpread = priceDiff;
-                        bestOpportunity = { sym, data, avgPrice };
-                    }
+                    
+                    opportunities.push({ sym, data, depth, avgPrice, priceDiff, buyFromNse });
                 } else {
                     if (tickEl) tickEl.classList.remove("active");
                     if (checkIcon) checkIcon.style.display = "none";
@@ -226,91 +280,132 @@ document.addEventListener("DOMContentLoaded", () => {
             }
         }
 
-        // Handle best opportunity
-        if (bestOpportunity && arbitrageFlag) {
-            arbitrageFlag.style.display = "block";
-            arbitrageFlag.textContent = `Arbitrage Opportunity Detected in ${bestOpportunity.sym}!`;
+        // Sort by spread descending
+        opportunities.sort((a, b) => b.priceDiff - a.priceDiff);
 
-            if (executionTargetSymbol) executionTargetSymbol.textContent = bestOpportunity.sym;
-            if (hiddenSymbolInput) hiddenSymbolInput.value = bestOpportunity.sym;
+        // UI handling for top opportunity (legacy manual override setup)
+        if (opportunities.length > 0 && arbitrageFlag) {
+            const best = opportunities[0];
+            arbitrageFlag.style.display = "block";
+            arbitrageFlag.textContent = `Arbitrage Opportunity Detected in ${best.sym}!`;
+            if (executionTargetSymbol) executionTargetSymbol.textContent = best.sym;
+            if (hiddenSymbolInput) hiddenSymbolInput.value = best.sym;
 
             const activeEl = document.activeElement;
             const isEditing = activeEl === buyPriceInput || activeEl === sellPriceInput || activeEl === buyExchangeSelect || activeEl === sellExchangeSelect;
-
             if (!isEditing) {
-                const buffer = bufferFraction * (thresholdPerc / 100) * bestOpportunity.avgPrice;
-                const lowerPrice = Math.min(bestOpportunity.data.nse, bestOpportunity.data.bse);
-                const higherPrice = Math.max(bestOpportunity.data.nse, bestOpportunity.data.bse);
+                const bEx = best.buyFromNse !== undefined ? (best.buyFromNse ? "NSE" : "BSE") : (best.data.nse < best.data.bse ? "NSE" : "BSE");
+                const sEx = bEx === "NSE" ? "BSE" : "NSE";
 
-                let bEx, sEx;
-                if (bestOpportunity.data.nse < bestOpportunity.data.bse) {
-                    bEx = "NSE"; sEx = "BSE";
+                // Use depth-aware aggressive pricing if available
+                let buyLimitPx, sellLimitPx;
+                if (best.depth && best.depth[`${bEx.toLowerCase()}_ask`] > 0) {
+                    // Aggressive: buy at best_ask + 1 tick, sell at best_bid - 1 tick
+                    const cheapAsk = best.depth[`${bEx.toLowerCase()}_ask`];
+                    const expensiveBid = best.depth[`${sEx.toLowerCase()}_bid`];
+                    buyLimitPx = (Math.ceil((cheapAsk + 0.05) / 0.05) * 0.05);
+                    sellLimitPx = (Math.floor((expensiveBid - 0.05) / 0.05) * 0.05);
                 } else {
-                    bEx = "BSE"; sEx = "NSE";
+                    const buffer = bufferFraction * (thresholdPerc / 100) * best.avgPrice;
+                    const lowerPrice = Math.min(best.data.nse, best.data.bse);
+                    const higherPrice = Math.max(best.data.nse, best.data.bse);
+                    buyLimitPx = (Math.ceil((lowerPrice + buffer) / 0.05) * 0.05);
+                    sellLimitPx = (Math.floor((higherPrice - buffer) / 0.05) * 0.05);
                 }
+                
                 buyExchangeSelect.value = bEx;
                 sellExchangeSelect.value = sEx;
-
-                const bPx = (Math.ceil((lowerPrice + buffer) / 0.05) * 0.05).toFixed(2);
-                const sPx = (Math.floor((higherPrice - buffer) / 0.05) * 0.05).toFixed(2);
-                buyPriceInput.value = bPx;
-                sellPriceInput.value = sPx;
-
-                // AUTO-TRADE: Fire immediately if armed
-                if (isAutoTradeArmed && tradeBtn) {
-                    addLog(`[AUTO-TRADE INTERCEPT] Trigger fired for ${bestOpportunity.sym} at ${thresholdPerc}% spread!`, "warning");
-                    isAutoTradeArmed = false;
-                    autoTradeBtn.innerHTML = `<span>Auto-Trade: OFF</span>`;
-                    autoTradeBtn.classList.remove("auto-trade-active");
-
-                    const quantity = parseInt(trackedQuantities[bestOpportunity.sym]) || 1;
-                    if (isNaN(quantity) || quantity <= 0) {
-                        addLog("Auto-trade aborted: invalid quantity.", "error");
-                    } else {
-                        tradeBtn.disabled = true;
-                        tradeBtn.innerHTML = `<span>Executing...</span>`;
-                        addLog(`Placing CONCURRENT orders for ${bestOpportunity.sym}. BUY[${bEx}] @ ${bPx} | SELL[${sEx}] @ ${sPx}`, "system");
-
-                        fetch(`${BASE_URL}/trade/once`, {
-                            method: "POST",
-                            headers: { "Content-Type": "application/json" },
-                            body: JSON.stringify({
-                                symbol: bestOpportunity.sym,
-                                buy_exchange: bEx,
-                                buy_price: parseFloat(bPx),
-                                sell_exchange: sEx,
-                                sell_price: parseFloat(sPx),
-                                quantity: quantity
-                            })
-                        }).then(r => r.json()).then(data => {
-                            if (data.status === "success") {
-                                addLog(data.message, "success");
-                                if (data.latency_ms !== undefined) {
-                                    const latVal = document.getElementById("latency-val");
-                                    if (latVal) {
-                                        latVal.textContent = `Latency: ${data.latency_ms} ms`;
-                                    }
-                                }
-                            } else {
-                                addLog(`Error: ${data.detail || data.message || "Execution failed."}`, "error");
-                            }
-                        }).catch(error => {
-                            addLog(`Network error: ${error.message}`, "error");
-                        }).finally(() => {
-                            tradeBtn.disabled = false;
-                            tradeBtn.innerHTML = `
-                                <span>Execute Single Trade</span>
-                                <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                                    <path d="M5 12h14M12 5l7 7-7 7"/>
-                                </svg>
-                            `;
-                            checkStatus();
-                        });
-                    }
-                }
+                buyPriceInput.value = buyLimitPx.toFixed(2);
+                sellPriceInput.value = sellLimitPx.toFixed(2);
             }
         } else if (arbitrageFlag) {
             arbitrageFlag.style.display = "none";
+        }
+
+        // ---------- AUTO-TRADE AUTONOMOUS EXECUTION ----------
+        if (isAutoTradeArmed && tradeBtn) {
+            const currentActiveCount = Object.keys(activeExecutions).length;
+            const availableSlots = 4 - currentActiveCount;
+
+            if (availableSlots > 0) {
+                // Filter out already running ops
+                const validOps = opportunities.filter(op => !activeExecutions[op.sym]);
+                
+                // Grab the top available ops up to limit
+                const opsToExecute = validOps.slice(0, availableSlots);
+
+                opsToExecute.forEach(op => {
+                    const quantity = parseInt(trackedQuantities[op.sym]) || 1;
+                    if (isNaN(quantity) || quantity <= 0) {
+                        addLog(`Auto-trade aborted for ${op.sym}: invalid quantity.`, "error");
+                        return;
+                    }
+
+                    // Calculate exchange sides — use depth-aware direction
+                    const bEx = op.buyFromNse !== undefined ? (op.buyFromNse ? "NSE" : "BSE") : (op.data.nse < op.data.bse ? "NSE" : "BSE");
+                    const sEx = bEx === "NSE" ? "BSE" : "NSE";
+
+                    // Depth-aware aggressive pricing for IOC fills
+                    let bPx, sPx;
+                    if (op.depth && op.depth[`${bEx.toLowerCase()}_ask`] > 0) {
+                        const cheapAsk = op.depth[`${bEx.toLowerCase()}_ask`];
+                        const expensiveBid = op.depth[`${sEx.toLowerCase()}_bid`];
+                        bPx = parseFloat((Math.ceil((cheapAsk + 0.05) / 0.05) * 0.05).toFixed(2));
+                        sPx = parseFloat((Math.floor((expensiveBid - 0.05) / 0.05) * 0.05).toFixed(2));
+                    } else {
+                        const buffer = bufferFraction * (thresholdPerc / 100) * op.avgPrice;
+                        const lowerPrice = Math.min(op.data.nse, op.data.bse);
+                        const higherPrice = Math.max(op.data.nse, op.data.bse);
+                        bPx = parseFloat((Math.ceil((lowerPrice + buffer) / 0.05) * 0.05).toFixed(2));
+                        sPx = parseFloat((Math.floor((higherPrice - buffer) / 0.05) * 0.05).toFixed(2));
+                    }
+
+                    // Evaluate local max allocation constraint
+                    const localMaxAllocation = parseFloat(allocatedFundsInput.value) || 0;
+                    const requiredMargin = ((bPx + sPx) * quantity) / 5.0; // 5x leverage assumption
+
+                    if (requiredMargin > localMaxAllocation) {
+                        addLog(`Auto-trade skipped ${op.sym}: requires ₹${requiredMargin.toFixed(2)} which exceeds your Max Allocation limit of ₹${localMaxAllocation.toFixed(2)}.`, "warning");
+                        return;
+                    }
+
+                    // Mark as in-flight lock
+                    activeExecutions[op.sym] = { startTime: Date.now() };
+                    addLog(`[AUTO-EXECUTE] Triggered ${op.sym} at ${thresholdPerc}% spread! Locking target...`, "warning");
+
+                    fetch(`${BASE_URL}/trade/once`, {
+                        method: "POST",
+                        headers: { "Content-Type": "application/json" },
+                        body: JSON.stringify({
+                            symbol: op.sym,
+                            buy_exchange: bEx,
+                            buy_price: parseFloat(bPx),
+                            sell_exchange: sEx,
+                            sell_price: parseFloat(sPx),
+                            quantity: quantity
+                        })
+                    }).then(r => r.json()).then(data => {
+                        if (data.status === "success") {
+                            addLog(data.message, "success");
+                        } else {
+                            addLog(`Execution failed for ${op.sym}: ${data.detail || data.message}`, "error");
+                            // Unlock immediately if execution hard failed locally
+                            if (data.message && data.message.includes("INSUFFICIENT FUNDS")) {
+                                delete activeExecutions[op.sym];
+                                isAutoTradeArmed = false;
+                                autoTradeBtn.innerHTML = `<span>Auto-Trade: OFF</span>`;
+                                autoTradeBtn.classList.remove("auto-trade-active");
+                                addLog("Auto-trade paused due to insufficient funds.", "error");
+                            } else {
+                                delete activeExecutions[op.sym];
+                            }
+                        }
+                    }).catch(error => {
+                        addLog(`Network error on ${op.sym}: ${error.message}`, "error");
+                        delete activeExecutions[op.sym];
+                    });
+                });
+            }
         }
     };
 
@@ -331,14 +426,38 @@ document.addEventListener("DOMContentLoaded", () => {
 
             ws.onmessage = (event) => {
                 try {
-                    const updates = JSON.parse(event.data);
-                    // updates = { "NSE:INFY": 1842.5, "BSE:INFY": 1843.0, ... }
-                    for (const [key, price] of Object.entries(updates)) {
+                    const payload = JSON.parse(event.data);
+
+                    // New format: { prices: { "NSE:INFY": 1842.5, ... }, depth: { "NSE:INFY": { best_bid, best_ask, ... }, ... } }
+                    // Backward compat: if no "prices" key, treat entire payload as flat price map
+                    const priceUpdates = payload.prices || payload;
+                    const depthUpdates = payload.depth || {};
+
+                    for (const [key, price] of Object.entries(priceUpdates)) {
                         const [exchange, sym] = key.split(":");
                         if (!priceCache[sym]) priceCache[sym] = { nse: 0, bse: 0 };
                         if (exchange === "NSE") priceCache[sym].nse = price;
                         if (exchange === "BSE") priceCache[sym].bse = price;
                     }
+
+                    // Process depth updates
+                    for (const [key, dInfo] of Object.entries(depthUpdates)) {
+                        const [exchange, sym] = key.split(":");
+                        if (!depthCache[sym]) depthCache[sym] = { nse_bid: 0, nse_ask: 0, bse_bid: 0, bse_ask: 0, nse_bid_qty: 0, nse_ask_qty: 0, bse_bid_qty: 0, bse_ask_qty: 0 };
+                        if (exchange === "NSE") {
+                            depthCache[sym].nse_bid = dInfo.best_bid || 0;
+                            depthCache[sym].nse_ask = dInfo.best_ask || 0;
+                            depthCache[sym].nse_bid_qty = dInfo.bid_qty || 0;
+                            depthCache[sym].nse_ask_qty = dInfo.ask_qty || 0;
+                        }
+                        if (exchange === "BSE") {
+                            depthCache[sym].bse_bid = dInfo.best_bid || 0;
+                            depthCache[sym].bse_ask = dInfo.best_ask || 0;
+                            depthCache[sym].bse_bid_qty = dInfo.bid_qty || 0;
+                            depthCache[sym].bse_ask_qty = dInfo.ask_qty || 0;
+                        }
+                    }
+
                     // Run detection immediately on every tick
                     processArbitrageDetection();
                 } catch (e) {
@@ -625,6 +744,39 @@ document.addEventListener("DOMContentLoaded", () => {
                 // Sort by time descending (newest first)
                 orders.sort((a, b) => new Date(b.order_timestamp) - new Date(a.order_timestamp));
                 
+                // Active Execution Cooldown Checking
+                Object.keys(activeExecutions).forEach(sym => {
+                    const lockInfo = activeExecutions[sym];
+                    if (lockInfo.unlocking) return;
+
+                    // Find orders for this symbol placed after the lock start time
+                    const relatedOrders = orders.filter(o => o.tradingsymbol === sym && new Date(o.order_timestamp).getTime() >= lockInfo.startTime);
+                    
+                    const buyCompleted = relatedOrders.some(o => o.transaction_type === "BUY" && o.status === "COMPLETE");
+                    const sellCompleted = relatedOrders.some(o => o.transaction_type === "SELL" && o.status === "COMPLETE");
+
+                    if (buyCompleted && sellCompleted) {
+                        lockInfo.unlocking = true;
+                        addLog(`Both legs for ${sym} are COMPLETE. Initiating 5s arbitrage cooldown...`, "system");
+                        setTimeout(() => {
+                            delete activeExecutions[sym];
+                            addLog(`[COOLDOWN CLEARED] ${sym} is re-armed for arbitrage.`, "system");
+                        }, 5000);
+                    }
+
+                    // Failsafe timeout: if both legs haven't completed within 30 seconds,
+                    // release the lock. The backend's _monitor_and_cleanup handles squareoff.
+                    const lockAge = Date.now() - lockInfo.startTime;
+                    if (lockAge > 30000 && !lockInfo.unlocking) {
+                        lockInfo.unlocking = true;
+                        addLog(`[TIMEOUT] ${sym} locked for >30s without both legs completing. Backend cleanup handles squareoff. Releasing lock...`, "error");
+                        setTimeout(() => {
+                            delete activeExecutions[sym];
+                            addLog(`[TIMEOUT CLEARED] ${sym} re-armed after timeout.`, "system");
+                        }, 2000);
+                    }
+                });
+
                 tbody.innerHTML = "";
                 orders.forEach(o => {
                     const time = new Date(o.order_timestamp).toLocaleTimeString();

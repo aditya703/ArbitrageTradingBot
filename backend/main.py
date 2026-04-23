@@ -273,6 +273,12 @@ def get_orders():
         return {"status": "error", "message": "Failed to fetch orders"}
     return {"status": "success", "data": orders}
 
+@app.get("/api/margins")
+def get_margins():
+    if not kite_client.is_connected():
+        return {"status": "error", "message": "Kite API not connected"}
+    return {"status": "success", "data": kite_client.get_available_margin()}
+
 # Mount the frontend directory if it exists
 frontend_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "frontend")
 if os.path.exists(frontend_path):

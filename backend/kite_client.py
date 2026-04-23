@@ -24,6 +24,10 @@ class KiteClient:
         self._prices_lock = threading.Lock()
         self._latest_prices = {}  # { "NSE:INFY": 1842.5, "BSE:INFY": 1843.0, ... }
 
+        # Market depth from MODE_FULL ticks
+        # { "NSE:INFY": { best_bid: 1842.0, best_ask: 1843.0, bid_qty: 500, ask_qty: 300 }, ... }
+        self._market_depth = {}
+
         # Cached is_connected result
         self._connected_cache = False
         self._connected_cache_time = 0
@@ -138,6 +142,7 @@ class KiteClient:
 
         def on_ticks(ws, ticks):
             updates = {}
+            depth_updates = {}
             with self._prices_lock:
                 for tick in ticks:
                     token = tick["instrument_token"]
@@ -147,14 +152,31 @@ class KiteClient:
                         self._latest_prices[symbol_key] = price
                         updates[symbol_key] = price
 
-            # Notify all WebSocket subscribers
+                        # Extract market depth from MODE_FULL ticks
+                        depth = tick.get("depth", {})
+                        if depth:
+                            buy_levels = depth.get("buy", [])
+                            sell_levels = depth.get("sell", [])
+                            depth_info = {
+                                "best_bid": buy_levels[0]["price"] if buy_levels and buy_levels[0].get("price") else price,
+                                "best_ask": sell_levels[0]["price"] if sell_levels and sell_levels[0].get("price") else price,
+                                "bid_qty": sum(l.get("quantity", 0) for l in buy_levels),
+                                "ask_qty": sum(l.get("quantity", 0) for l in sell_levels),
+                            }
+                            self._market_depth[symbol_key] = depth_info
+                            depth_updates[symbol_key] = depth_info
+
+            # Notify all WebSocket subscribers with prices + depth
             if updates:
-                self._notify_subscribers(updates)
+                payload = {"prices": updates}
+                if depth_updates:
+                    payload["depth"] = depth_updates
+                self._notify_subscribers(payload)
 
         def on_connect(ws, response):
-            logging.info(f"KiteTicker connected. Subscribing to {len(tokens)} tokens.")
+            logging.info(f"KiteTicker connected. Subscribing to {len(tokens)} tokens in MODE_FULL for depth data.")
             ws.subscribe(tokens)
-            ws.set_mode(ws.MODE_LTP, tokens)
+            ws.set_mode(ws.MODE_FULL, tokens)
 
         def on_close(ws, code, reason):
             logging.warning(f"KiteTicker closed: {code} - {reason}")
@@ -179,8 +201,8 @@ class KiteClient:
         tokens = [t[0] for t in token_pairs]
         try:
             self.kws.subscribe(tokens)
-            self.kws.set_mode(self.kws.MODE_LTP, tokens)
-            logging.info(f"Updated subscriptions: {len(tokens)} tokens")
+            self.kws.set_mode(self.kws.MODE_FULL, tokens)
+            logging.info(f"Updated subscriptions: {len(tokens)} tokens (MODE_FULL)")
         except Exception as e:
             logging.error(f"Failed to update subscriptions: {e}")
 
@@ -188,6 +210,11 @@ class KiteClient:
         """Return a snapshot of all latest prices from WebSocket stream."""
         with self._prices_lock:
             return dict(self._latest_prices)
+
+    def get_market_depth(self):
+        """Return a snapshot of all market depth data from MODE_FULL ticks."""
+        with self._prices_lock:
+            return dict(self._market_depth)
 
     # ---------- WebSocket Subscriber Notification ----------
 
@@ -230,10 +257,15 @@ class KiteClient:
             logging.error(f"Error fetching holdings: {e}")
             return None
 
-    def place_order(self, tradingsymbol, exchange, transaction_type, quantity, order_type="MARKET", product="MIS", price: float = None):
+    def place_order(self, tradingsymbol, exchange, transaction_type, quantity, order_type="MARKET", product="MIS", price: float = None, validity: str = None):
         if not self.kite:
             return None
         try:
+            # Use IOC for LIMIT orders (instant fill or cancel) to prevent stuck orders.
+            # Use DAY for MARKET orders (squareoff/emergency) to ensure fill.
+            if validity is None:
+                validity = self.kite.VALIDITY_IOC if order_type == "LIMIT" else self.kite.VALIDITY_DAY
+
             order_params = {
                 "tradingsymbol": tradingsymbol,
                 "exchange": exchange,
@@ -242,7 +274,7 @@ class KiteClient:
                 "order_type": order_type,
                 "product": product,
                 "variety": self.kite.VARIETY_REGULAR,
-                "validity": self.kite.VALIDITY_DAY
+                "validity": validity
             }
             if price is not None:
                 order_params["price"] = price
@@ -251,6 +283,18 @@ class KiteClient:
         except Exception as e:
             logging.error(f"Error placing order: {e}")
             raise e
+
+    def cancel_order(self, order_id, variety="regular"):
+        """Cancel a pending/open order by its order ID."""
+        if not self.kite:
+            return None
+        try:
+            self.kite.cancel_order(variety=variety, order_id=order_id)
+            logging.info(f"Cancelled order: {order_id}")
+            return True
+        except Exception as e:
+            logging.error(f"Error cancelling order {order_id}: {e}")
+            return False
 
     def get_positions(self):
         if not self.kite:
@@ -269,3 +313,15 @@ class KiteClient:
         except Exception as e:
             logging.error(f"Error fetching orders: {e}")
             return None
+
+    def get_available_margin(self):
+        """Fetches the actual cash available for trading."""
+        if not self.kite:
+            return 0
+        try:
+            margins = self.kite.margins(segment="equity")
+            return margins.get("available", {}).get("live_balance", 0)
+        except Exception as e:
+            logging.error(f"Error fetching margins: {e}")
+            return 0
+
